@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Control Operativo Kuroda</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  @keyframes dupPulse{0%,100%{background-color:#fee2e2}50%{background-color:#fecaca}}
+  .dup-row{animation:dupPulse 1.4s ease-in-out infinite}
+  .fade-in{animation:fadeIn .25s ease-out}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:4px}
+</style>
+</head>
+<body class="bg-gray-50 text-gray-800 min-h-screen">
+
+<div id="app"></div>
+
+<script>
+/* ============================================================
+   CONFIGURACIÓN SUPABASE — reemplazar con datos reales del proyecto
+============================================================ */
+const SUPABASE_URL = 'https://qmfvyowemztxsapfjntf.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFtZnZ5b3dlbXp0eHNhcGZqbnRmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyNjI5MzQsImV4cCI6MjA5NzgzODkzNH0.tl4MfQzBn7hCHViEeapW7O6cvRuHvDIGv7NK4eqgKIg';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+let session = null;
+let perfil = null; // { id, nombre_completo, rol, sucursal_id, sucursal_nombre }
+let sucursales = [];
+
+const app = document.getElementById('app');
+// Detección por dispositivo (no por ancho), así girar el celular no cambia a vista de escritorio
+const isMobile = () => /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+/* ---------- Pitido + confirmación de duplicado ---------- */
+function beep(){
+  try{
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = 'square'; o.frequency.value = 880;
+    o.connect(g); g.connect(ctx.destination);
+    g.gain.setValueAtTime(0.25, ctx.currentTime);
+    o.start(); o.stop(ctx.currentTime + 0.18);
+  }catch(e){}
+}
+async function buscarPrevio(ticket, traspaso){
+  const { data } = await sb.from('registros').select('status, created_at')
+    .eq('ticket', ticket).eq('traspaso', traspaso)
+    .order('created_at', { ascending:false }).limit(1);
+  return data && data.length ? data[0] : null;
+}
+function confirmarDuplicado(prev){
+  return new Promise(resolve=>{
+    beep();
+    const esParcial = prev.status === 'Parcial';
+    const overlay = document.createElement('div');
+    overlay.className = 'fixed inset-0 bg-black/40 flex items-center justify-center z-[60] p-4';
+    overlay.innerHTML = `
+      <div class="bg-white rounded-2xl p-5 max-w-sm w-full fade-in">
+        <h2 class="font-semibold text-base mb-2 ${esParcial?'text-amber-600':'text-red-600'}">
+          ${esParcial ? '⚠ Entrega anterior en parcialidades' : '⚠ Posible registro duplicado'}</h2>
+        <p class="text-sm text-gray-600 mb-4">
+          ${esParcial
+            ? 'Este Ticket/Traspaso ya tiene una entrega previa registrada como Parcial. Verifica antes de continuar.'
+            : 'Este Ticket y Traspaso ya fueron registrados antes. Si continúas, serás responsable de un posible error de entrega duplicada.'}</p>
+        <div class="flex gap-2">
+          <button id="dupCancel" class="flex-1 border border-gray-200 rounded-lg py-2 text-sm">Cancelar</button>
+          <button id="dupOk" class="flex-1 text-white rounded-lg py-2 text-sm ${esParcial?'bg-amber-600 hover:bg-amber-700':'bg-red-600 hover:bg-red-700'}">Sí, continuar</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('#dupCancel').onclick = ()=>{ overlay.remove(); resolve(false); };
+    overlay.querySelector('#dupOk').onclick = ()=>{ overlay.remove(); resolve(true); };
+  });
+}
+// Exclusividad entre dos campos: si uno tiene valor, deshabilita el otro
+function exclusividad(idA, idB){
+  const a = document.getElementById(idA), b = document.getElementById(idB);
+  const sync = ()=>{
+    b.disabled = a.value.trim().length > 0;
+    a.disabled = b.value.trim().length > 0;
+  };
+  a.addEventListener('input', sync); b.addEventListener('input', sync);
+}
+
+/* ---------- Helpers UI ---------- */
+function toast(msg, ok=true){
+  const t = document.createElement('div');
+  t.className = `fixed bottom-4 right-4 z-50 px-4 py-2 rounded-lg shadow-sm text-sm text-white fade-in ${ok?'bg-emerald-600':'bg-red-600'}`;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(()=>t.remove(), 2600);
+}
+function icon(name, cls="w-5 h-5"){
+  const paths = {
+    home:'M3 12l2-2 7-7 7 7 2 2M5 10v10h14V10',
+    plus:'M12 5v14M5 12h14',
+    list:'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01',
+    users:'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75',
+    logout:'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9',
+    chart:'M3 3v18h18M18 17V9M13 17V5M8 17v-3',
+    gear:'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06A2 2 0 1 1 7.04 4.3l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.13.61.49 1.14 1 1.51H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z',
+  };
+  return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${paths[name]||''}"/></svg>`;
+}
+
+/* ============================================================
+   LOGIN
+============================================================ */
+function renderLogin(){
+  app.innerHTML = `
+  <main class="min-h-screen flex items-center justify-center p-4">
+    <section class="w-full max-w-sm bg-white border border-gray-200 rounded-2xl p-6 fade-in">
+      <div class="text-center mb-6">
+        <div class="w-12 h-12 mx-auto rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-lg">CK</div>
+        <h1 class="mt-3 font-semibold text-lg">Control Operativo Kuroda</h1>
+        <p class="text-sm text-gray-500">Inicia sesión para continuar</p>
+      </div>
+      <form id="loginForm" class="space-y-3">
+        <div>
+          <label class="text-sm text-gray-600">Correo</label>
+          <input type="email" id="loginEmail" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        </div>
+        <div>
+          <label class="text-sm text-gray-600">Contraseña</label>
+          <input type="password" id="loginPass" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        </div>
+        <button type="submit" class="w-full bg-indigo-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-indigo-700 transition">Entrar</button>
+        <p id="loginErr" class="text-sm text-red-600 hidden"></p>
+      </form>
+    </section>
+  </main>`;
+
+  document.getElementById('loginForm').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const email = document.getElementById('loginEmail').value.trim();
+    const password = document.getElementById('loginPass').value;
+    const errEl = document.getElementById('loginErr');
+    errEl.classList.add('hidden');
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
+    if (error){ errEl.textContent = 'Correo o contraseña incorrectos.'; errEl.classList.remove('hidden'); return; }
+    session = data.session;
+    await cargarPerfil();
+    if (!perfil){ errEl.textContent = 'Tu usuario no tiene perfil asignado. Contacta al Admin.'; errEl.classList.remove('hidden'); return; }
+    renderShell();
+  });
+}
+
+async function cargarPerfil(){
+  const uid = session.user.id;
+  const { data: u } = await sb.from('usuarios')
+    .select('id, nombre_completo, rol_id, sucursal_id, roles(nombre), sucursales(nombre)')
+    .eq('id', uid).single();
+  if (!u){ perfil = null; return; }
+  perfil = {
+    id: u.id,
+    nombre_completo: u.nombre_completo,
+    rol: u.roles?.nombre || 'Registro',
+    sucursal_id: u.sucursal_id,
+    sucursal_nombre: u.sucursales?.nombre || '—'
+  };
+  const { data: s } = await sb.from('sucursales').select('id,nombre').eq('activo', true);
+  sucursales = s || [];
+}
+
+async function logout(){
+  await sb.auth.signOut();
+  session = null; perfil = null;
+  renderLogin();
+}
+
+/* ============================================================
+   SHELL — decide mobile (registro) vs desktop (dashboard)
+============================================================ */
+function renderShell(){
+  if (isMobile()){
+    renderMobileEntry();
+  } else {
+    renderDesktopDashboard('inicio');
+  }
+}
+window.addEventListener('resize', ()=>{ if (perfil) renderShell(); });
+
+/* ============================================================
+   MOBILE — Formulario de captura (4 campos) + geolocalización
+============================================================ */
+function renderMobileEntry(){
+  app.innerHTML = `
+  <main class="min-h-screen bg-gray-50">
+    <header class="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between sticky top-0 z-10">
+      <div>
+        <p class="font-semibold text-sm">${perfil.nombre_completo}</p>
+        <p class="text-xs text-gray-500">${perfil.sucursal_nombre} · ${perfil.rol}</p>
+      </div>
+      <button id="btnLogout" class="text-gray-400">${icon('logout','w-5 h-5')}</button>
+    </header>
+
+    <section class="p-4 max-w-md mx-auto fade-in">
+      <h1 class="font-semibold text-base mb-1">Nuevo registro</h1>
+      <p class="text-sm text-gray-500 mb-4">Captura ticket y traspaso de la sucursal.</p>
+
+      <form id="entryForm" class="space-y-4 bg-white border border-gray-200 rounded-2xl p-4">
+        <div>
+          <label class="text-sm text-gray-600">Picking</label>
+          <input id="fTicket" required class="w-full mt-1 px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400">
+        </div>
+        <div>
+          <label class="text-sm text-gray-600">Traspaso</label>
+          <input id="fTraspaso" required class="w-full mt-1 px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400">
+        </div>
+        <div>
+          <label class="text-sm text-gray-600">Status</label>
+          <div class="flex gap-2 mt-1">
+            <label class="flex-1"><input type="radio" name="status" value="Total" class="hidden peer" checked>
+              <span class="block text-center py-2.5 rounded-lg border border-gray-200 text-sm peer-checked:bg-indigo-600 peer-checked:text-white peer-checked:border-indigo-600 cursor-pointer">Total</span></label>
+            <label class="flex-1"><input type="radio" name="status" value="Parcial" class="hidden peer">
+              <span class="block text-center py-2.5 rounded-lg border border-gray-200 text-sm peer-checked:bg-indigo-600 peer-checked:text-white peer-checked:border-indigo-600 cursor-pointer">Parcial</span></label>
+          </div>
+        </div>
+        <div>
+          <label class="text-sm text-gray-600">Comentario</label>
+          <textarea id="fComentario" rows="3" class="w-full mt-1 px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"></textarea>
+        </div>
+        <p id="gpsStatus" class="text-xs text-gray-400">Obteniendo ubicación…</p>
+        <button type="submit" id="btnSave" class="w-full bg-indigo-600 text-white rounded-lg py-3 text-sm font-medium hover:bg-indigo-700 transition">Guardar</button>
+      </form>
+
+      <button id="btnVerLista" class="w-full mt-4 text-sm text-indigo-600 font-medium py-2">Ver registros del día →</button>
+    </section>
+  </main>`;
+
+  document.getElementById('btnLogout').onclick = logout;
+  document.getElementById('btnVerLista').onclick = renderMobileList;
+  exclusividad('fTicket', 'fTraspaso');
+
+  let coords = null;
+  const gpsEl = document.getElementById('gpsStatus');
+  if (navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(
+      pos => { coords = { lat: pos.coords.latitude, lng: pos.coords.longitude }; gpsEl.textContent = 'Ubicación capturada ✓'; gpsEl.className='text-xs text-emerald-600'; },
+      ()=> { gpsEl.textContent = 'No se pudo obtener ubicación (se guardará sin GPS)'; gpsEl.className='text-xs text-amber-600'; }
+    );
+  }
+
+  document.getElementById('entryForm').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const btn = document.getElementById('btnSave');
+    btn.disabled = true; btn.textContent = 'Guardando…';
+
+    const ticket = document.getElementById('fTicket').value.trim();
+    const traspaso = document.getElementById('fTraspaso').value.trim();
+    const status = document.querySelector('input[name=status]:checked').value;
+    const comentario = document.getElementById('fComentario').value.trim();
+
+    const prev = await buscarPrevio(ticket, traspaso);
+    if (prev){
+      const continuar = await confirmarDuplicado(prev);
+      if (!continuar){ btn.disabled = false; btn.textContent = 'Guardar'; return; }
+    }
+
+    const { error } = await sb.from('registros').insert({
+      ticket, traspaso, status, comentario,
+      sucursal_id: perfil.sucursal_id,
+      usuario_id: perfil.id,
+      lat: coords?.lat ?? null,
+      lng: coords?.lng ?? null
+    });
+
+    btn.disabled = false; btn.textContent = 'Guardar';
+    if (error){ toast('Error al guardar: ' + error.message, false); return; }
+    toast('Registro guardado');
+    e.target.reset();
+  });
+}
+
+async function renderMobileList(){
+  app.innerHTML = `
+  <main class="min-h-screen bg-gray-50">
+    <header class="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3 sticky top-0 z-10">
+      <button id="btnBack" class="text-gray-500">←</button>
+      <p class="font-semibold text-sm">Registros recientes</p>
+    </header>
+    <section id="listWrap" class="p-4 space-y-2 max-w-md mx-auto"><p class="text-sm text-gray-400">Cargando…</p></section>
+  </main>`;
+  document.getElementById('btnBack').onclick = renderMobileEntry;
+
+  const { data, error } = await sb.from('registros')
+    .select('*').eq('sucursal_id', perfil.sucursal_id)
+    .order('created_at', { ascending:false }).limit(30);
+
+  const wrap = document.getElementById('listWrap');
+  if (error){ wrap.innerHTML = `<p class="text-sm text-red-600">${error.message}</p>`; return; }
+  if (!data.length){ wrap.innerHTML = `<p class="text-sm text-gray-400">Sin registros aún.</p>`; return; }
+
+  wrap.innerHTML = data.map(r => `
+    <div class="rounded-xl border p-3 ${r.es_duplicado ? (r.status==='Parcial' ? 'border-amber-300 bg-amber-50' : 'dup-row border-red-300') : 'bg-white border-gray-200'}">
+      <div class="flex justify-between text-sm font-medium">
+        <span>Picking ${r.ticket} · Traspaso ${r.traspaso}</span>
+        <span class="px-2 py-0.5 rounded-full text-xs ${r.status==='Total'?'bg-emerald-100 text-emerald-700':'bg-amber-100 text-amber-700'}">${r.status}</span>
+      </div>
+      ${r.comentario ? `<p class="text-xs text-gray-500 mt-1">${r.comentario}</p>` : ''}
+      ${r.es_duplicado ? (r.status==='Parcial'
+          ? `<p class="text-xs text-amber-600 font-medium mt-1">⚠ Entrega en parcialidades</p>`
+          : `<p class="text-xs text-red-600 font-medium mt-1">⚠ Posible duplicado</p>`) : ''}
+      <p class="text-xs text-gray-400 mt-1">${new Date(r.created_at).toLocaleString()}</p>
+    </div>`).join('');
+}
+
+/* ============================================================
+   DESKTOP — Dashboard administrativo
+============================================================ */
+function navItem(key, label, iconName, active){
+  return `<button data-nav="${key}" class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm w-full text-left transition ${active?'bg-indigo-50 text-indigo-700 font-medium':'text-gray-600 hover:bg-gray-50'}">
+    ${icon(iconName,'w-4 h-4')}<span>${label}</span></button>`;
+}
+
+function renderDesktopDashboard(view){
+  const isAdmin = perfil.rol === 'Admin';
+  app.innerHTML = `
+  <div class="flex min-h-screen">
+    <aside class="w-60 bg-white border-r border-gray-200 p-4 flex flex-col gap-1 fixed h-full">
+      <div class="flex items-center gap-2 px-2 mb-4">
+        <div class="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center text-sm font-bold">CK</div>
+        <span class="font-semibold text-sm">Kuroda Operativo</span>
+      </div>
+      ${navItem('inicio','Inicio / KPIs','home', view==='inicio')}
+      ${navItem('registros','Consulta de registros','list', view==='registros')}
+      ${navItem('nuevo','Nuevo registro','plus', view==='nuevo')}
+      ${isAdmin ? navItem('usuarios','Usuarios y roles','users', view==='usuarios') : ''}
+      ${isAdmin ? navItem('config','Configuración','gear', view==='config') : ''}
+      <div class="mt-auto pt-3 border-t border-gray-200">
+        <p class="text-xs text-gray-400 px-2">${perfil.nombre_completo}</p>
+        <p class="text-xs text-gray-400 px-2 mb-2">${perfil.rol} · ${perfil.sucursal_nombre}</p>
+        <button id="btnLogout" class="flex items-center gap-2 px-2 text-sm text-gray-500 hover:text-red-600">${icon('logout','w-4 h-4')} Salir</button>
+      </div>
+    </aside>
+    <main class="flex-1 ml-60 p-6" id="mainView"></main>
+  </div>`;
+  document.getElementById('btnLogout').onclick = logout;
+  document.querySelectorAll('[data-nav]').forEach(b => b.onclick = () => renderDesktopDashboard(b.dataset.nav));
+
+  const main = document.getElementById('mainView');
+  if (view === 'inicio') renderKpis(main);
+  else if (view === 'registros') renderRegistrosTable(main);
+  else if (view === 'nuevo') renderNuevoRegistroDesktop(main);
+  else if (view === 'usuarios' && isAdmin) renderUsuarios(main);
+  else if (view === 'config' && isAdmin) renderConfig(main);
+}
+
+async function renderKpis(main){
+  main.innerHTML = `<p class="text-sm text-gray-400">Cargando KPIs…</p>`;
+  const isAdmin = perfil.rol === 'Admin';
+  let query = sb.from('registros').select('*');
+  if (!isAdmin) query = query.eq('sucursal_id', perfil.sucursal_id);
+  const { data, error } = await query;
+  if (error){ main.innerHTML = `<p class="text-red-600 text-sm">${error.message}</p>`; return; }
+
+  const hoy = new Date().toDateString();
+  const hoyRegs = data.filter(r => new Date(r.created_at).toDateString() === hoy);
+  const dup = data.filter(r => r.es_duplicado).length;
+
+  const porUsuario = {};
+  hoyRegs.forEach(r => porUsuario[r.usuario_id] = (porUsuario[r.usuario_id]||0)+1);
+  const porSucursal = {};
+  data.forEach(r => porSucursal[r.sucursal_id] = (porSucursal[r.sucursal_id]||0)+1);
+
+  main.innerHTML = `
+    <h1 class="font-semibold text-lg mb-3">Resumen del día</h1>
+    <div class="grid grid-cols-4 gap-2 mb-4">
+      ${kpiCard('Registros hoy', hoyRegs.length, 'plus')}
+      ${kpiCard('Total histórico', data.length, 'list')}
+      ${kpiCard('Duplicados', dup, 'chart')}
+      ${kpiCard('Sucursales', sucursales.length, 'home')}
+    </div>
+    <div class="grid grid-cols-2 gap-4">
+      <div class="bg-white border border-gray-200 rounded-2xl p-4">
+        <h2 class="text-sm font-medium mb-3">Registros por sucursal</h2>
+        <canvas id="chartSucursal" height="180"></canvas>
+      </div>
+      <div class="bg-white border border-gray-200 rounded-2xl p-4">
+        <h2 class="text-sm font-medium mb-3">Status (Total vs Parcial)</h2>
+        <canvas id="chartStatus" height="180"></canvas>
+      </div>
+    </div>`;
+
+  const sucLabels = Object.keys(porSucursal).map(id => sucursales.find(s=>s.id===id)?.nombre || id);
+  new Chart(document.getElementById('chartSucursal'), {
+    type:'bar',
+    data:{ labels: sucLabels, datasets:[{ data: Object.values(porSucursal), backgroundColor:'#4f46e5', borderRadius:6 }] },
+    options:{ plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
+  });
+  const totalCount = data.filter(r=>r.status==='Total').length;
+  const parcialCount = data.filter(r=>r.status==='Parcial').length;
+  new Chart(document.getElementById('chartStatus'), {
+    type:'doughnut',
+    data:{ labels:['Total','Parcial'], datasets:[{ data:[totalCount,parcialCount], backgroundColor:['#10b981','#f59e0b'] }] }
+  });
+}
+function kpiCard(label, value, iconName){
+  return `<div class="bg-white border border-gray-200 rounded-lg p-2">
+    <div class="flex items-center justify-between">
+      <p class="text-[11px] text-gray-500 leading-tight">${label}</p>
+      <span class="text-indigo-600">${icon(iconName,'w-3 h-3')}</span>
+    </div>
+    <p class="text-base font-semibold mt-0.5">${value}</p>
+  </div>`;
+}
+
+async function renderRegistrosTable(main){
+  const isAdmin = perfil.rol === 'Admin';
+  const opcionesSuc = sucursales.map(s=>`<option value="${s.id}">${s.nombre}</option>`).join('');
+  main.innerHTML = `
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="font-semibold text-lg">Consulta de registros</h1>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-2xl p-3 mb-3 flex flex-wrap gap-2 items-end">
+      <div><label class="text-xs text-gray-500">Buscar</label>
+        <input id="search" placeholder="Picking o traspaso…" class="block px-3 py-2 border border-gray-200 rounded-lg text-sm w-48 focus:outline-none focus:ring-2 focus:ring-indigo-500"></div>
+      <div><label class="text-xs text-gray-500">Desde</label>
+        <input id="fDesde" type="date" class="block px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
+      <div><label class="text-xs text-gray-500">Hasta</label>
+        <input id="fHasta" type="date" class="block px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
+      ${isAdmin ? `<div><label class="text-xs text-gray-500">Sucursal</label>
+        <select id="fSucursal" class="block px-3 py-2 border border-gray-200 rounded-lg text-sm"><option value="">Todas</option>${opcionesSuc}</select></div>` : ''}
+      <div><label class="text-xs text-gray-500">Status</label>
+        <select id="fStatus" class="block px-3 py-2 border border-gray-200 rounded-lg text-sm"><option value="">Todos</option><option>Total</option><option>Parcial</option></select></div>
+      <div><label class="text-xs text-gray-500">Solo duplicados</label>
+        <select id="fDup" class="block px-3 py-2 border border-gray-200 rounded-lg text-sm"><option value="">Todos</option><option value="si">Sí</option><option value="no">No</option></select></div>
+      <button id="btnLimpiar" class="px-3 py-2 text-sm text-gray-500 border border-gray-200 rounded-lg">Limpiar</button>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-2xl overflow-hidden">
+      <table class="w-full text-sm">
+        <thead class="bg-gray-50 text-gray-500 text-left">
+          <tr><th class="px-4 py-2">Picking</th><th class="px-4 py-2">Traspaso</th><th class="px-4 py-2">Status</th>
+          <th class="px-4 py-2">Sucursal</th><th class="px-4 py-2">Comentario</th><th class="px-4 py-2">Fecha</th></tr>
+        </thead>
+        <tbody id="tbody"><tr><td colspan="6" class="px-4 py-4 text-gray-400">Cargando…</td></tr></tbody>
+      </table>
+    </div>`;
+
+  let query = sb.from('registros').select('*, sucursales(nombre)').order('created_at',{ascending:false}).limit(500);
+  if (!isAdmin) query = query.eq('sucursal_id', perfil.sucursal_id);
+  const { data, error } = await query;
+  const tbody = document.getElementById('tbody');
+  if (error){ tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-4 text-red-600">${error.message}</td></tr>`; return; }
+
+  function draw(rows){
+    tbody.innerHTML = rows.map(r => `
+      <tr class="border-t border-gray-100 ${r.es_duplicado ? (r.status==='Parcial' ? 'bg-amber-50' : 'dup-row') : ''}">
+        <td class="px-4 py-2 font-medium">${r.ticket}</td>
+        <td class="px-4 py-2">${r.traspaso}</td>
+        <td class="px-4 py-2"><span class="px-2 py-0.5 rounded-full text-xs ${r.status==='Total'?'bg-emerald-100 text-emerald-700':'bg-amber-100 text-amber-700'}">${r.status}</span></td>
+        <td class="px-4 py-2">${r.sucursales?.nombre||''}</td>
+        <td class="px-4 py-2 text-gray-500">${r.comentario||''}${r.es_duplicado ? (r.status==='Parcial' ? '<br><span class="text-amber-600 font-medium">⚠ Entrega en parcialidades</span>' : '<br><span class="text-red-600 font-medium">⚠ Duplicado</span>') : ''}</td>
+        <td class="px-4 py-2 text-gray-400">${new Date(r.created_at).toLocaleString()}</td>
+      </tr>`).join('') || `<tr><td colspan="6" class="px-4 py-4 text-gray-400">Sin resultados.</td></tr>`;
+  }
+
+  function aplicarFiltros(){
+    const q = document.getElementById('search').value.toLowerCase();
+    const desde = document.getElementById('fDesde').value;
+    const hasta = document.getElementById('fHasta').value;
+    const sucSel = isAdmin ? document.getElementById('fSucursal').value : '';
+    const statusSel = document.getElementById('fStatus').value;
+    const dupSel = document.getElementById('fDup').value;
+
+    let rows = data;
+    if (q) rows = rows.filter(r => r.ticket.toLowerCase().includes(q) || r.traspaso.toLowerCase().includes(q));
+    if (desde) rows = rows.filter(r => new Date(r.created_at) >= new Date(desde));
+    if (hasta) rows = rows.filter(r => new Date(r.created_at) <= new Date(hasta + 'T23:59:59'));
+    if (sucSel) rows = rows.filter(r => r.sucursal_id === sucSel);
+    if (statusSel) rows = rows.filter(r => r.status === statusSel);
+    if (dupSel) rows = rows.filter(r => dupSel === 'si' ? r.es_duplicado : !r.es_duplicado);
+    draw(rows);
+  }
+
+  draw(data);
+  ['search','fDesde','fHasta','fStatus','fDup'].forEach(id => document.getElementById(id).addEventListener('input', aplicarFiltros));
+  if (isAdmin) document.getElementById('fSucursal').addEventListener('input', aplicarFiltros);
+  document.getElementById('btnLimpiar').onclick = ()=>{
+    document.getElementById('search').value=''; document.getElementById('fDesde').value=''; document.getElementById('fHasta').value='';
+    document.getElementById('fStatus').value=''; document.getElementById('fDup').value='';
+    if (isAdmin) document.getElementById('fSucursal').value='';
+    draw(data);
+  };
+}
+
+function renderNuevoRegistroDesktop(main){
+  const opciones = sucursales.map(s=>`<option value="${s.id}">${s.nombre}</option>`).join('');
+  main.innerHTML = `
+    <h1 class="font-semibold text-lg mb-4">Nuevo registro</h1>
+    <form id="entryFormD" class="bg-white border border-gray-200 rounded-2xl p-5 max-w-md space-y-4">
+      <div><label class="text-sm text-gray-600">Picking</label>
+        <input id="dTicket" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"></div>
+      <div><label class="text-sm text-gray-600">Traspaso</label>
+        <input id="dTraspaso" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"></div>
+      <div><label class="text-sm text-gray-600">Status</label>
+        <select id="dStatus" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"><option>Total</option><option>Parcial</option></select></div>
+      ${perfil.rol==='Admin' ? `<div><label class="text-sm text-gray-600">Sucursal</label>
+        <select id="dSucursal" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">${opciones}</select></div>` : ''}
+      <div><label class="text-sm text-gray-600">Comentario</label>
+        <textarea id="dComentario" rows="3" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></textarea></div>
+      <button class="w-full bg-indigo-600 text-white rounded-lg py-2.5 text-sm font-medium hover:bg-indigo-700 transition">Guardar</button>
+    </form>`;
+  exclusividad('dTicket', 'dTraspaso');
+  document.getElementById('entryFormD').addEventListener('submit', async e=>{
+    e.preventDefault();
+    const sucursal_id = perfil.rol==='Admin' ? document.getElementById('dSucursal').value : perfil.sucursal_id;
+    const ticket = document.getElementById('dTicket').value.trim();
+    const traspaso = document.getElementById('dTraspaso').value.trim();
+
+    const prev = await buscarPrevio(ticket, traspaso);
+    if (prev){
+      const continuar = await confirmarDuplicado(prev);
+      if (!continuar) return;
+    }
+
+    const { error } = await sb.from('registros').insert({
+      ticket, traspaso,
+      status: document.getElementById('dStatus').value,
+      comentario: document.getElementById('dComentario').value.trim(),
+      sucursal_id, usuario_id: perfil.id
+    });
+    if (error){ toast(error.message, false); return; }
+    toast('Registro guardado'); e.target.reset();
+  });
+}
+
+async function renderUsuarios(main){
+  const opciones = sucursales.map(s=>`<option value="${s.id}">${s.nombre}</option>`).join('');
+  main.innerHTML = `
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="font-semibold text-lg">Usuarios y roles</h1>
+      <button id="btnNuevoUsr" class="bg-indigo-600 text-white text-sm px-3 py-2 rounded-lg hover:bg-indigo-700">+ Nuevo usuario</button>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-2xl overflow-hidden">
+      <table class="w-full text-sm">
+        <thead class="bg-gray-50 text-gray-500 text-left">
+          <tr><th class="px-4 py-2">Nombre</th><th class="px-4 py-2">Correo</th><th class="px-4 py-2">Rol</th><th class="px-4 py-2">Sucursal</th></tr>
+        </thead>
+        <tbody id="tbodyUsr"><tr><td colspan="4" class="px-4 py-4 text-gray-400">Cargando…</td></tr></tbody>
+      </table>
+    </div>
+    <dialog id="dlgUsr" class="rounded-2xl p-0 w-full max-w-sm backdrop:bg-black/30">
+      <form id="formUsr" class="p-5 space-y-3">
+        <h2 class="font-semibold text-base mb-2">Nuevo usuario</h2>
+        <div><label class="text-sm text-gray-600">Nombre completo</label>
+          <input id="uNombre" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
+        <div><label class="text-sm text-gray-600">Correo</label>
+          <input id="uEmail" type="email" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
+        <div><label class="text-sm text-gray-600">Contraseña inicial</label>
+          <input id="uPass" type="password" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
+        <div><label class="text-sm text-gray-600">Rol</label>
+          <select id="uRol" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"><option value="2">Registro</option><option value="1">Admin</option></select></div>
+        <div><label class="text-sm text-gray-600">Sucursal</label>
+          <select id="uSucursal" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">
+            ${opciones}<option value="__nueva__">+ Agregar nueva sucursal…</option>
+          </select>
+          <div id="nuevaSucWrap" class="hidden mt-2 flex gap-2">
+            <input id="nuevaSucNombre" placeholder="Nombre de la sucursal" class="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">
+            <button type="button" id="btnGuardarSuc" class="px-3 py-2 bg-gray-800 text-white rounded-lg text-sm">Guardar</button>
+          </div>
+        </div>
+        <div class="flex gap-2 pt-2">
+          <button type="button" id="btnCancelarUsr" class="flex-1 border border-gray-200 rounded-lg py-2 text-sm">Cancelar</button>
+          <button class="flex-1 bg-indigo-600 text-white rounded-lg py-2 text-sm">Crear</button>
+        </div>
+      </form>
+    </dialog>`;
+
+  const dlg = document.getElementById('dlgUsr');
+  document.getElementById('btnNuevoUsr').onclick = ()=> dlg.showModal();
+  document.getElementById('btnCancelarUsr').onclick = ()=> dlg.close();
+
+  const selSuc = document.getElementById('uSucursal');
+  const wrapSuc = document.getElementById('nuevaSucWrap');
+  selSuc.addEventListener('change', ()=>{
+    wrapSuc.classList.toggle('hidden', selSuc.value !== '__nueva__');
+  });
+  document.getElementById('btnGuardarSuc').onclick = async ()=>{
+    const nombre = document.getElementById('nuevaSucNombre').value.trim();
+    if (!nombre){ toast('Escribe el nombre de la sucursal', false); return; }
+    const { data, error } = await sb.from('sucursales').insert({ nombre }).select().single();
+    if (error){ toast(error.message, false); return; }
+    sucursales.push(data);
+    const opt = document.createElement('option');
+    opt.value = data.id; opt.textContent = data.nombre;
+    selSuc.insertBefore(opt, selSuc.querySelector('option[value="__nueva__"]'));
+    selSuc.value = data.id;
+    wrapSuc.classList.add('hidden');
+    document.getElementById('nuevaSucNombre').value = '';
+    toast('Sucursal agregada');
+  };
+
+  document.getElementById('formUsr').addEventListener('submit', async e=>{
+    e.preventDefault();
+    if (selSuc.value === '__nueva__'){ toast('Guarda la nueva sucursal antes de crear el usuario', false); return; }
+    // Nota: la creación de auth.users vía signUp requiere confirmación de correo
+    // o uso de la Admin API desde un backend seguro (service_role). Aquí se usa signUp estándar.
+    const { data, error } = await sb.auth.signUp({
+      email: document.getElementById('uEmail').value.trim(),
+      password: document.getElementById('uPass').value
+    });
+    if (error){ toast(error.message, false); return; }
+    const { error: err2 } = await sb.from('usuarios').insert({
+      id: data.user.id,
+      nombre_completo: document.getElementById('uNombre').value.trim(),
+      email: document.getElementById('uEmail').value.trim(),
+      rol_id: Number(document.getElementById('uRol').value),
+      sucursal_id: document.getElementById('uSucursal').value
+    });
+    if (err2){ toast(err2.message, false); return; }
+    toast('Usuario creado'); dlg.close(); cargarTablaUsuarios();
+  });
+
+  cargarTablaUsuarios();
+}
+async function cargarTablaUsuarios(){
+  const { data, error } = await sb.from('usuarios').select('*, roles(nombre), sucursales(nombre)');
+  const tbody = document.getElementById('tbodyUsr');
+  if (error){ tbody.innerHTML = `<tr><td colspan="4" class="px-4 py-4 text-red-600">${error.message}</td></tr>`; return; }
+  tbody.innerHTML = data.map(u => `
+    <tr class="border-t border-gray-100">
+      <td class="px-4 py-2">${u.nombre_completo}</td>
+      <td class="px-4 py-2 text-gray-500">${u.email}</td>
+      <td class="px-4 py-2">${u.roles?.nombre}</td>
+      <td class="px-4 py-2">${u.sucursales?.nombre||'—'}</td>
+    </tr>`).join('');
+}
+
+/* ============================================================
+   CONFIGURACIÓN (solo Admin) — carga inicial desde Excel/CSV
+============================================================ */
+let importBuffer = []; // filas crudas leídas del archivo
+let importHeaders = [];
+
+function renderConfig(main){
+  main.innerHTML = `
+    <h1 class="font-semibold text-lg mb-1">Configuración</h1>
+    <p class="text-sm text-gray-500 mb-4">Carga inicial de base de datos desde un sistema externo (Excel o CSV).</p>
+
+    <div class="bg-white border border-gray-200 rounded-2xl p-5 max-w-2xl space-y-4">
+      <div>
+        <label class="text-sm text-gray-600">Archivo (.xlsx, .xls o .csv)</label>
+        <input id="fileImport" type="file" accept=".xlsx,.xls,.csv" class="block w-full mt-1 text-sm">
+      </div>
+      <div id="mapeoWrap" class="hidden space-y-3">
+        <p class="text-sm text-gray-600">Relaciona cada columna de tu archivo con el campo correspondiente:</p>
+        <div id="mapeoCampos" class="grid grid-cols-2 gap-3 text-sm"></div>
+        <div>
+          <label class="text-sm text-gray-600">Sucursal por defecto (si el archivo no trae columna de sucursal)</label>
+          <select id="mapSucursalDefault" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">
+            ${sucursales.map(s=>`<option value="${s.id}">${s.nombre}</option>`).join('')}
+          </select>
+        </div>
+        <p id="previewCount" class="text-xs text-gray-400"></p>
+        <button id="btnImportar" class="bg-indigo-600 text-white text-sm px-4 py-2 rounded-lg hover:bg-indigo-700">Importar registros</button>
+        <p id="importStatus" class="text-sm"></p>
+      </div>
+    </div>`;
+
+  document.getElementById('fileImport').addEventListener('change', async (e)=>{
+    const file = e.target.files[0];
+    if (!file) return;
+    const data = await file.arrayBuffer();
+    const wb = XLSX.read(data, { type:'array' });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval:'' });
+    if (!rows.length){ toast('El archivo no tiene datos', false); return; }
+    importBuffer = rows;
+    importHeaders = Object.keys(rows[0]);
+    mostrarMapeo();
+  });
+
+  function mostrarMapeo(){
+    const campos = [
+      { key:'ticket', label:'Picking (Ticket)', required:true },
+      { key:'traspaso', label:'Traspaso', required:true },
+      { key:'status', label:'Status (Total/Parcial)', required:false },
+      { key:'comentario', label:'Comentario', required:false },
+      { key:'sucursal', label:'Sucursal (nombre)', required:false },
+      { key:'fecha', label:'Fecha del registro', required:false },
+    ];
+    const opcionesCols = importHeaders.map(h=>`<option value="${h}">${h}</option>`).join('');
+    document.getElementById('mapeoCampos').innerHTML = campos.map(c => `
+      <div>
+        <label class="text-xs text-gray-500">${c.label}${c.required?' *':''}</label>
+        <select data-map="${c.key}" class="w-full mt-1 px-2 py-1.5 border border-gray-200 rounded-lg text-sm">
+          <option value="">— No aplica —</option>${opcionesCols}
+        </select>
+      </div>`).join('');
+    document.getElementById('mapeoWrap').classList.remove('hidden');
+    document.getElementById('previewCount').textContent = `${importBuffer.length} filas detectadas en el archivo.`;
+  }
+
+  document.getElementById('btnImportar')?.addEventListener('click', importarAhora);
+  main.querySelector('#mapeoWrap').addEventListener('click', e=>{
+    if (e.target.id === 'btnImportar') importarAhora();
+  });
+
+  async function importarAhora(){
+    const mapeos = {};
+    main.querySelectorAll('[data-map]').forEach(sel => mapeos[sel.dataset.map] = sel.value);
+    if (!mapeos.ticket || !mapeos.traspaso){
+      toast('Debes mapear al menos Picking y Traspaso', false); return;
+    }
+    const statusEl = document.getElementById('importStatus');
+    statusEl.textContent = 'Importando…'; statusEl.className = 'text-sm text-gray-500';
+
+    const sucursalDefault = document.getElementById('mapSucursalDefault').value;
+    const registrosNuevos = [];
+    for (const row of importBuffer){
+      const ticket = String(row[mapeos.ticket] ?? '').trim();
+      const traspaso = String(row[mapeos.traspaso] ?? '').trim();
+      if (!ticket && !traspaso) continue;
+
+      let status = mapeos.status ? String(row[mapeos.status] ?? '').trim() : '';
+      status = /parc/i.test(status) ? 'Parcial' : 'Total';
+
+      let sucursal_id = sucursalDefault;
+      if (mapeos.sucursal){
+        const nombreSuc = String(row[mapeos.sucursal] ?? '').trim();
+        let suc = sucursales.find(s => s.nombre.toLowerCase() === nombreSuc.toLowerCase());
+        if (!suc && nombreSuc){
+          const { data: nueva } = await sb.from('sucursales').insert({ nombre: nombreSuc }).select().single();
+          if (nueva){ sucursales.push(nueva); suc = nueva; }
+        }
+        if (suc) sucursal_id = suc.id;
+      }
+
+      let created_at = undefined;
+      if (mapeos.fecha && row[mapeos.fecha]){
+        const f = new Date(row[mapeos.fecha]);
+        if (!isNaN(f)) created_at = f.toISOString();
+      }
+
+      registrosNuevos.push({
+        ticket, traspaso, status,
+        comentario: mapeos.comentario ? String(row[mapeos.comentario] ?? '').trim() : '',
+        sucursal_id, usuario_id: perfil.id,
+        ...(created_at ? { created_at } : {})
+      });
+    }
+
+    let insertados = 0, errores = 0;
+    for (let i=0; i<registrosNuevos.length; i+=200){
+      const bloque = registrosNuevos.slice(i, i+200);
+      const { error } = await sb.from('registros').insert(bloque);
+      if (error){ errores += bloque.length; } else { insertados += bloque.length; }
+    }
+    statusEl.textContent = `Importación terminada: ${insertados} registros guardados${errores?`, ${errores} con error`:''}.`;
+    statusEl.className = errores ? 'text-sm text-amber-600' : 'text-sm text-emerald-600';
+    toast(`Importación completa (${insertados} registros)`);
+  }
+}
+
+/* ============================================================
+   ARRANQUE
+============================================================ */
+(async function init(){
+  const { data } = await sb.auth.getSession();
+  if (data.session){
+    session = data.session;
+    await cargarPerfil();
+    if (perfil) { renderShell(); return; }
+  }
+  renderLogin();
+})();
+</script>
+</body>
+</html>
