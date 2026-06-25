@@ -110,6 +110,18 @@ function confirmarDuplicado(prev){
     overlay.querySelector('#dupOk').onclick = ()=>{ overlay.remove(); resolve(true); };
   });
 }
+// Lee el mensaje real devuelto por una Edge Function cuando falla (status no-2xx)
+async function mensajeErrorFuncion(error, fallback){
+  if (!error) return fallback;
+  try{
+    if (error.context && typeof error.context.json === 'function'){
+      const body = await error.context.json();
+      if (body?.error) return body.error;
+    }
+  }catch(e){}
+  return error.message || fallback;
+}
+
 // Filtra un input para aceptar solo dígitos (Picking / Traspaso)
 function soloNumeros(id){
   const el = document.getElementById(id);
@@ -785,7 +797,10 @@ async function renderUsuarios(main){
     const { data: res, error } = await sb.functions.invoke('admin-create-user', {
       body: { email: emailInterno, password: document.getElementById('uPass').value }
     });
-    if (error || res?.error){ toast((res?.error) || error.message, false); return; }
+    if (error || res?.error){
+      toast(res?.error || await mensajeErrorFuncion(error, 'No se pudo crear el usuario'), false);
+      return;
+    }
     const { error: err2 } = await sb.from('usuarios').insert({
       id: res.user_id,
       nombre_completo: document.getElementById('uNombre').value.trim(),
@@ -852,11 +867,13 @@ function dialogoEditarUsuario(u){
 
     const nuevaPass = dlg.querySelector('#eNuevaPass').value.trim();
     if (nuevaPass){
-      const { error: errPass } = await sb.functions.invoke('admin-reset-password', {
+      const { data: resPass, error: errPass } = await sb.functions.invoke('admin-reset-password', {
         body: { user_id: u.id, new_password: nuevaPass }
       });
-      if (errPass){ toast('Perfil actualizado, pero la contraseña no se pudo cambiar: ' + errPass.message, false); }
-      else toast('Usuario y contraseña actualizados');
+      if (errPass || resPass?.error){
+        const msg = resPass?.error || await mensajeErrorFuncion(errPass, 'No se pudo cambiar la contraseña');
+        toast('Perfil actualizado, pero la contraseña no se pudo cambiar: ' + msg, false);
+      } else toast('Usuario y contraseña actualizados');
     } else {
       toast('Usuario actualizado');
     }
@@ -887,7 +904,10 @@ async function cargarTablaUsuarios(){
     const { data: res, error: errDel } = await sb.functions.invoke('admin-delete-user', {
       body: { user_id: btn.dataset.del }
     });
-    if (errDel || res?.error){ toast((res?.error) || errDel.message, false); return; }
+    if (errDel || res?.error){
+      toast(res?.error || await mensajeErrorFuncion(errDel, 'No se pudo eliminar el usuario'), false);
+      return;
+    }
     toast('Usuario eliminado');
     cargarTablaUsuarios();
   });
@@ -1087,4 +1107,3 @@ function renderConfig(main){
 </script>
 </body>
 </html>
-
