@@ -2,11 +2,12 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>Control Operativo Kuroda</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   @keyframes dupPulse{0%,100%{background-color:#fee2e2}50%{background-color:#fecaca}}
@@ -15,6 +16,24 @@
   @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
   ::-webkit-scrollbar{width:6px;height:6px}
   ::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:4px}
+  body{-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+  input,select,textarea,button{-webkit-appearance:none;appearance:none;font-size:16px}
+
+  /* Liquid glass 3D */
+  .liquid-card{
+    background: linear-gradient(135deg, rgba(255,255,255,0.85), rgba(245,247,255,0.6));
+    backdrop-filter: blur(14px);
+    border: 1px solid rgba(255,255,255,0.6);
+    box-shadow: 0 8px 24px -8px rgba(79,70,229,0.18), inset 0 1px 0 rgba(255,255,255,0.7);
+  }
+  .liquid-kpi{
+    box-shadow: 0 6px 16px -4px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.35), inset 0 -6px 12px -4px rgba(0,0,0,0.18);
+  }
+  .liquid-blob{
+    position:absolute; width:60px; height:60px; border-radius:50%;
+    background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.55), rgba(255,255,255,0) 70%);
+    top:-18px; right:-18px; filter: blur(2px);
+  }
 </style>
 </head>
 <body class="bg-gray-50 text-gray-800 min-h-screen">
@@ -34,18 +53,31 @@ let perfil = null; // { id, nombre_completo, rol, sucursal_id, sucursal_nombre }
 let sucursales = [];
 
 const app = document.getElementById('app');
-// Detección por dispositivo (no por ancho), así girar el celular no cambia a vista de escritorio
-const isMobile = () => /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+// Detección por dispositivo (no por ancho). Incluye iPad, que en iOS reporta UA de escritorio.
+const isMobile = () => /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+/* ---------- Audio: desbloqueo requerido por iOS Safari en el primer toque ---------- */
+let audioCtx = null;
+function desbloquearAudio(){
+  if (!audioCtx){
+    try{ audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ return; }
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+document.addEventListener('touchstart', desbloquearAudio, { once:true, passive:true });
+document.addEventListener('click', desbloquearAudio, { once:true });
 
 /* ---------- Pitido + confirmación de duplicado ---------- */
 function beep(){
   try{
-    const ctx = new (window.AudioContext||window.webkitAudioContext)();
-    const o = ctx.createOscillator(), g = ctx.createGain();
+    desbloquearAudio();
+    if (!audioCtx) return;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
     o.type = 'square'; o.frequency.value = 880;
-    o.connect(g); g.connect(ctx.destination);
-    g.gain.setValueAtTime(0.25, ctx.currentTime);
-    o.start(); o.stop(ctx.currentTime + 0.18);
+    o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.25, audioCtx.currentTime);
+    o.start(); o.stop(audioCtx.currentTime + 0.18);
   }catch(e){}
 }
 async function buscarPrevio(ticket, traspaso){
@@ -78,7 +110,63 @@ function confirmarDuplicado(prev){
     overlay.querySelector('#dupOk').onclick = ()=>{ overlay.remove(); resolve(true); };
   });
 }
-// Exclusividad entre dos campos: si uno tiene valor, deshabilita el otro
+// Filtra un input para aceptar solo dígitos (Picking / Traspaso)
+function soloNumeros(id){
+  const el = document.getElementById(id);
+  el.setAttribute('inputmode','numeric');
+  el.setAttribute('pattern','[0-9]*');
+  el.addEventListener('input', ()=>{
+    const limpio = el.value.replace(/[^0-9]/g,'');
+    if (limpio !== el.value) el.value = limpio;
+  });
+}
+
+// Botón de cámara junto a un input: abre el lector y rellena el campo sin enviar el formulario
+let escanerActivo = null;
+function abrirEscaner(targetInputId){
+  const overlay = document.createElement('div');
+  overlay.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-[70] p-4';
+  overlay.innerHTML = `
+    <div class="bg-white rounded-2xl p-4 w-full max-w-sm fade-in">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="font-semibold text-sm">Escanear código</h2>
+        <button id="cerrarEscaner" class="text-gray-400 text-sm">✕ Cerrar</button>
+      </div>
+      <div id="qr-reader" class="rounded-lg overflow-hidden"></div>
+      <p class="text-xs text-gray-400 mt-2">Apunta la cámara al código QR o de barras.</p>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const cerrar = async ()=>{
+    try{ if (escanerActivo){ await escanerActivo.stop(); escanerActivo.clear(); } }catch(e){}
+    escanerActivo = null;
+    overlay.remove();
+  };
+  overlay.querySelector('#cerrarEscaner').onclick = cerrar;
+
+  escanerActivo = new Html5Qrcode('qr-reader');
+  escanerActivo.start(
+    { facingMode: 'environment' },
+    { fps: 12, qrbox: 220 },
+    (texto)=>{
+      const soloDigitos = texto.replace(/[^0-9]/g,'');
+      const input = document.getElementById(targetInputId);
+      input.value = soloDigitos;
+      input.dispatchEvent(new Event('input', { bubbles:true })); // dispara exclusividad/validaciones sin enviar el form
+      beep();
+      cerrar();
+    },
+    ()=>{ /* sigue intentando, ignorar frames sin código */ }
+  ).catch(()=>{
+    overlay.querySelector('#qr-reader').innerHTML = `<p class="text-sm text-red-600 p-3">No se pudo abrir la cámara. Revisa los permisos del navegador.</p>`;
+  });
+}
+function botonEscaner(targetInputId){
+  return `<button type="button" data-scan="${targetInputId}" class="px-3 border border-gray-200 rounded-lg text-gray-500 hover:bg-gray-50" title="Escanear código">
+    <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M7 12h10"/>
+    </svg></button>`;
+}
 function exclusividad(idA, idB){
   const a = document.getElementById(idA), b = document.getElementById(idB);
   const sync = ()=>{
@@ -123,12 +211,12 @@ function renderLogin(){
       </div>
       <form id="loginForm" class="space-y-3">
         <div>
-          <label class="text-sm text-gray-600">Correo</label>
-          <input type="email" id="loginEmail" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+          <label class="text-sm text-gray-600">Usuario</label>
+          <input type="text" id="loginUser" required autocomplete="username" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
         </div>
         <div>
           <label class="text-sm text-gray-600">Contraseña</label>
-          <input type="password" id="loginPass" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+          <input type="password" id="loginPass" required autocomplete="current-password" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
         </div>
         <button type="submit" class="w-full bg-indigo-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-indigo-700 transition">Entrar</button>
         <p id="loginErr" class="text-sm text-red-600 hidden"></p>
@@ -138,12 +226,16 @@ function renderLogin(){
 
   document.getElementById('loginForm').addEventListener('submit', async (e)=>{
     e.preventDefault();
-    const email = document.getElementById('loginEmail').value.trim();
+    const username = document.getElementById('loginUser').value.trim();
     const password = document.getElementById('loginPass').value;
     const errEl = document.getElementById('loginErr');
     errEl.classList.add('hidden');
+
+    const { data: email, error: errEmail } = await sb.rpc('fn_email_por_usuario', { p_username: username });
+    if (errEmail || !email){ errEl.textContent = 'Usuario o contraseña incorrectos.'; errEl.classList.remove('hidden'); return; }
+
     const { data, error } = await sb.auth.signInWithPassword({ email, password });
-    if (error){ errEl.textContent = 'Correo o contraseña incorrectos.'; errEl.classList.remove('hidden'); return; }
+    if (error){ errEl.textContent = 'Usuario o contraseña incorrectos.'; errEl.classList.remove('hidden'); return; }
     session = data.session;
     await cargarPerfil();
     if (!perfil){ errEl.textContent = 'Tu usuario no tiene perfil asignado. Contacta al Admin.'; errEl.classList.remove('hidden'); return; }
@@ -154,12 +246,13 @@ function renderLogin(){
 async function cargarPerfil(){
   const uid = session.user.id;
   const { data: u } = await sb.from('usuarios')
-    .select('id, nombre_completo, rol_id, sucursal_id, roles(nombre), sucursales(nombre)')
+    .select('id, nombre_completo, username, rol_id, sucursal_id, roles(nombre), sucursales(nombre)')
     .eq('id', uid).single();
   if (!u){ perfil = null; return; }
   perfil = {
     id: u.id,
     nombre_completo: u.nombre_completo,
+    username: u.username,
     rol: u.roles?.nombre || 'Registro',
     sucursal_id: u.sucursal_id,
     sucursal_nombre: u.sucursales?.nombre || '—'
@@ -178,10 +271,10 @@ async function logout(){
    SHELL — decide mobile (registro) vs desktop (dashboard)
 ============================================================ */
 function renderShell(){
-  if (isMobile()){
+  if (isMobile() && perfil.rol === 'Registro'){
     renderMobileEntry();
   } else {
-    renderDesktopDashboard('inicio');
+    renderDesktopDashboard(perfil.rol === 'Auditor' ? 'auditoria' : 'inicio');
   }
 }
 window.addEventListener('resize', ()=>{ if (perfil) renderShell(); });
@@ -192,7 +285,7 @@ window.addEventListener('resize', ()=>{ if (perfil) renderShell(); });
 function renderMobileEntry(){
   app.innerHTML = `
   <main class="min-h-screen bg-gray-50">
-    <header class="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between sticky top-0 z-10">
+    <header class="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between sticky top-0 z-10" style="padding-top: max(0.75rem, env(safe-area-inset-top))">
       <div>
         <p class="font-semibold text-sm">${perfil.nombre_completo}</p>
         <p class="text-xs text-gray-500">${perfil.sucursal_nombre} · ${perfil.rol}</p>
@@ -207,11 +300,17 @@ function renderMobileEntry(){
       <form id="entryForm" class="space-y-4 bg-white border border-gray-200 rounded-2xl p-4">
         <div>
           <label class="text-sm text-gray-600">Picking</label>
-          <input id="fTicket" required class="w-full mt-1 px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400">
+          <div class="flex gap-2 mt-1">
+            <input id="fTicket" required class="flex-1 px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400">
+            ${botonEscaner('fTicket')}
+          </div>
         </div>
         <div>
           <label class="text-sm text-gray-600">Traspaso</label>
-          <input id="fTraspaso" required class="w-full mt-1 px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400">
+          <div class="flex gap-2 mt-1">
+            <input id="fTraspaso" required class="flex-1 px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400">
+            ${botonEscaner('fTraspaso')}
+          </div>
         </div>
         <div>
           <label class="text-sm text-gray-600">Status</label>
@@ -237,14 +336,30 @@ function renderMobileEntry(){
   document.getElementById('btnLogout').onclick = logout;
   document.getElementById('btnVerLista').onclick = renderMobileList;
   exclusividad('fTicket', 'fTraspaso');
+  soloNumeros('fTicket'); soloNumeros('fTraspaso');
+  document.querySelectorAll('[data-scan]').forEach(btn => btn.onclick = ()=> abrirEscaner(btn.dataset.scan));
 
   let coords = null;
   const gpsEl = document.getElementById('gpsStatus');
   if (navigator.geolocation){
-    navigator.geolocation.getCurrentPosition(
-      pos => { coords = { lat: pos.coords.latitude, lng: pos.coords.longitude }; gpsEl.textContent = 'Ubicación capturada ✓'; gpsEl.className='text-xs text-emerald-600'; },
-      ()=> { gpsEl.textContent = 'No se pudo obtener ubicación (se guardará sin GPS)'; gpsEl.className='text-xs text-amber-600'; }
-    );
+    if (!window.isSecureContext){
+      gpsEl.textContent = 'La ubicación requiere HTTPS (iOS la bloquea en http). Se guardará sin GPS.';
+      gpsEl.className = 'text-xs text-amber-600';
+    } else {
+      navigator.geolocation.getCurrentPosition(
+        pos => { coords = { lat: pos.coords.latitude, lng: pos.coords.longitude }; gpsEl.textContent = 'Ubicación capturada ✓'; gpsEl.className='text-xs text-emerald-600'; },
+        (err) => {
+          const msg = err.code === 1
+            ? 'Permiso de ubicación denegado. Activa Ubicación para este navegador en Ajustes.'
+            : 'No se pudo obtener ubicación (se guardará sin GPS).';
+          gpsEl.textContent = msg; gpsEl.className = 'text-xs text-amber-600';
+        },
+        { enableHighAccuracy:true, timeout:8000, maximumAge:0 }
+      );
+    }
+  } else {
+    gpsEl.textContent = 'Este navegador no soporta geolocalización.';
+    gpsEl.className = 'text-xs text-amber-600';
   }
 
   document.getElementById('entryForm').addEventListener('submit', async (e)=>{
@@ -281,7 +396,7 @@ function renderMobileEntry(){
 async function renderMobileList(){
   app.innerHTML = `
   <main class="min-h-screen bg-gray-50">
-    <header class="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3 sticky top-0 z-10">
+    <header class="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3 sticky top-0 z-10" style="padding-top: max(0.75rem, env(safe-area-inset-top))">
       <button id="btnBack" class="text-gray-500">←</button>
       <p class="font-semibold text-sm">Registros recientes</p>
     </header>
@@ -328,9 +443,10 @@ function renderDesktopDashboard(view){
         <div class="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center text-sm font-bold">CK</div>
         <span class="font-semibold text-sm">Kuroda Operativo</span>
       </div>
-      ${navItem('inicio','Inicio / KPIs','home', view==='inicio')}
-      ${navItem('registros','Consulta de registros','list', view==='registros')}
-      ${navItem('nuevo','Nuevo registro','plus', view==='nuevo')}
+      ${perfil.rol !== 'Auditor' ? navItem('inicio','Inicio / KPIs','home', view==='inicio') : ''}
+      ${perfil.rol !== 'Auditor' ? navItem('registros','Consulta de registros','list', view==='registros') : ''}
+      ${perfil.rol === 'Registro' || perfil.rol === 'Admin' ? navItem('nuevo','Nuevo registro','plus', view==='nuevo') : ''}
+      ${(isAdmin || perfil.rol === 'Auditor') ? navItem('auditoria','Auditoría de duplicados','chart', view==='auditoria') : ''}
       ${isAdmin ? navItem('usuarios','Usuarios y roles','users', view==='usuarios') : ''}
       ${isAdmin ? navItem('config','Configuración','gear', view==='config') : ''}
       <div class="mt-auto pt-3 border-t border-gray-200">
@@ -348,9 +464,12 @@ function renderDesktopDashboard(view){
   if (view === 'inicio') renderKpis(main);
   else if (view === 'registros') renderRegistrosTable(main);
   else if (view === 'nuevo') renderNuevoRegistroDesktop(main);
+  else if (view === 'auditoria') renderAuditoria(main);
   else if (view === 'usuarios' && isAdmin) renderUsuarios(main);
   else if (view === 'config' && isAdmin) renderConfig(main);
 }
+
+let chartSucursalInst = null, chartActividadInst = null;
 
 async function renderKpis(main){
   main.innerHTML = `<p class="text-sm text-gray-400">Cargando KPIs…</p>`;
@@ -364,50 +483,91 @@ async function renderKpis(main){
   const hoyRegs = data.filter(r => new Date(r.created_at).toDateString() === hoy);
   const dup = data.filter(r => r.es_duplicado).length;
 
-  const porUsuario = {};
-  hoyRegs.forEach(r => porUsuario[r.usuario_id] = (porUsuario[r.usuario_id]||0)+1);
   const porSucursal = {};
   data.forEach(r => porSucursal[r.sucursal_id] = (porSucursal[r.sucursal_id]||0)+1);
 
+  // Actividad: registros por hora del día actual (0-23h)
+  const porHora = Array(24).fill(0);
+  hoyRegs.forEach(r => { porHora[new Date(r.created_at).getHours()]++; });
+
   main.innerHTML = `
-    <h1 class="font-semibold text-lg mb-3">Resumen del día</h1>
-    <div class="grid grid-cols-4 gap-2 mb-4">
-      ${kpiCard('Registros hoy', hoyRegs.length, 'plus')}
-      ${kpiCard('Total histórico', data.length, 'list')}
-      ${kpiCard('Duplicados', dup, 'chart')}
-      ${kpiCard('Sucursales', sucursales.length, 'home')}
-    </div>
-    <div class="grid grid-cols-2 gap-4">
-      <div class="bg-white border border-gray-200 rounded-2xl p-4">
-        <h2 class="text-sm font-medium mb-3">Registros por sucursal</h2>
-        <canvas id="chartSucursal" height="180"></canvas>
+    <div class="h-[calc(100vh-3rem)] flex flex-col overflow-hidden">
+      <h1 class="font-semibold text-base mb-2 text-gray-700">Resumen del día</h1>
+      <div class="grid grid-cols-4 gap-2 mb-3">
+        ${kpiCard('Registros hoy', hoyRegs.length, 'plus', 'from-indigo-500 to-violet-600')}
+        ${kpiCard('Total histórico', data.length, 'list', 'from-sky-500 to-cyan-500')}
+        ${kpiCard('Duplicados', dup, 'chart', 'from-rose-500 to-orange-500')}
+        ${kpiCard('Sucursales', sucursales.length, 'home', 'from-emerald-500 to-teal-500')}
       </div>
-      <div class="bg-white border border-gray-200 rounded-2xl p-4">
-        <h2 class="text-sm font-medium mb-3">Status (Total vs Parcial)</h2>
-        <canvas id="chartStatus" height="180"></canvas>
+      <div class="grid grid-cols-2 gap-3 flex-1 min-h-0">
+        <div class="liquid-card rounded-2xl p-3 flex flex-col min-h-0">
+          <div class="flex items-center justify-between mb-1">
+            <h2 class="text-sm font-medium text-gray-700">Registros por sucursal</h2>
+            <select id="tipoSucursal" class="text-xs border border-gray-200 rounded-lg px-2 py-1 bg-white/70">
+              <option value="bar">Barras</option><option value="line">Línea</option>
+              <option value="radar">Radar</option><option value="doughnut">Dona</option><option value="pie">Pastel</option>
+            </select>
+          </div>
+          <div class="flex-1 min-h-0 relative"><canvas id="chartSucursal"></canvas></div>
+        </div>
+        <div class="liquid-card rounded-2xl p-3 flex flex-col min-h-0">
+          <div class="flex items-center justify-between mb-1">
+            <h2 class="text-sm font-medium text-gray-700">Actividad (hoy, por hora)</h2>
+            <select id="tipoActividad" class="text-xs border border-gray-200 rounded-lg px-2 py-1 bg-white/70">
+              <option value="line">Línea</option><option value="bar">Barras</option>
+              <option value="radar">Radar</option><option value="pie">Pastel</option>
+            </select>
+          </div>
+          <div class="flex-1 min-h-0 relative"><canvas id="chartActividad"></canvas></div>
+        </div>
       </div>
     </div>`;
 
   const sucLabels = Object.keys(porSucursal).map(id => sucursales.find(s=>s.id===id)?.nombre || id);
-  new Chart(document.getElementById('chartSucursal'), {
-    type:'bar',
-    data:{ labels: sucLabels, datasets:[{ data: Object.values(porSucursal), backgroundColor:'#4f46e5', borderRadius:6 }] },
-    options:{ plugins:{legend:{display:false}}, scales:{ y:{beginAtZero:true} } }
-  });
-  const totalCount = data.filter(r=>r.status==='Total').length;
-  const parcialCount = data.filter(r=>r.status==='Parcial').length;
-  new Chart(document.getElementById('chartStatus'), {
-    type:'doughnut',
-    data:{ labels:['Total','Parcial'], datasets:[{ data:[totalCount,parcialCount], backgroundColor:['#10b981','#f59e0b'] }] }
-  });
+  const sucValues = Object.values(porSucursal);
+  const horaLabels = Array.from({length:24}, (_,h)=> `${h}:00`);
+
+  function dibujarSucursal(tipo){
+    if (chartSucursalInst) chartSucursalInst.destroy();
+    const esCircular = tipo==='doughnut' || tipo==='pie';
+    chartSucursalInst = new Chart(document.getElementById('chartSucursal'), {
+      type: tipo,
+      data: { labels: sucLabels, datasets:[{
+        label:'Registros', data: sucValues,
+        backgroundColor: esCircular ? ['#6366f1','#06b6d4','#f43f5e','#10b981','#f59e0b','#8b5cf6'] : 'rgba(99,102,241,0.75)',
+        borderColor:'#6366f1', borderRadius: tipo==='bar' ? 8 : 0, tension:0.35, fill: tipo==='line'
+      }]},
+      options:{ maintainAspectRatio:false, plugins:{ legend:{ display: esCircular } },
+        scales: esCircular ? {} : { y:{ beginAtZero:true, ticks:{precision:0} } } }
+    });
+  }
+  function dibujarActividad(tipo){
+    if (chartActividadInst) chartActividadInst.destroy();
+    const esCircular = tipo==='pie';
+    chartActividadInst = new Chart(document.getElementById('chartActividad'), {
+      type: tipo,
+      data: { labels: horaLabels, datasets:[{
+        label:'Registros', data: porHora,
+        backgroundColor: esCircular ? horaLabels.map((_,i)=>`hsl(${i*15},70%,60%)`) : 'rgba(16,185,129,0.25)',
+        borderColor:'#10b981', borderWidth:2, tension:0.4, fill: tipo==='line', pointRadius: tipo==='line' ? 2 : 0
+      }]},
+      options:{ maintainAspectRatio:false, plugins:{ legend:{ display: esCircular } },
+        scales: esCircular ? {} : { y:{ beginAtZero:true, ticks:{precision:0} } } }
+    });
+  }
+  dibujarSucursal('bar');
+  dibujarActividad('line');
+  document.getElementById('tipoSucursal').addEventListener('change', e=> dibujarSucursal(e.target.value));
+  document.getElementById('tipoActividad').addEventListener('change', e=> dibujarActividad(e.target.value));
 }
-function kpiCard(label, value, iconName){
-  return `<div class="bg-white border border-gray-200 rounded-lg p-2">
-    <div class="flex items-center justify-between">
-      <p class="text-[11px] text-gray-500 leading-tight">${label}</p>
-      <span class="text-indigo-600">${icon(iconName,'w-3 h-3')}</span>
+function kpiCard(label, value, iconName, gradiente){
+  return `<div class="liquid-kpi bg-gradient-to-br ${gradiente} rounded-xl p-2 text-white relative overflow-hidden">
+    <div class="liquid-blob"></div>
+    <div class="flex items-center justify-between relative z-10">
+      <p class="text-[11px] text-white/85 leading-tight">${label}</p>
+      <span class="text-white/90">${icon(iconName,'w-3 h-3')}</span>
     </div>
-    <p class="text-base font-semibold mt-0.5">${value}</p>
+    <p class="text-base font-semibold mt-0.5 relative z-10">${value}</p>
   </div>`;
 }
 
@@ -437,7 +597,7 @@ async function renderRegistrosTable(main){
       <table class="w-full text-sm">
         <thead class="bg-gray-50 text-gray-500 text-left">
           <tr><th class="px-4 py-2">Picking</th><th class="px-4 py-2">Traspaso</th><th class="px-4 py-2">Status</th>
-          <th class="px-4 py-2">Sucursal</th><th class="px-4 py-2">Comentario</th><th class="px-4 py-2">Fecha</th></tr>
+          <th class="px-4 py-2">Sucursal</th><th class="px-4 py-2">Comentario</th><th class="px-4 py-2">Fecha</th>${isAdmin ? '<th class="px-4 py-2"></th>' : ''}</tr>
         </thead>
         <tbody id="tbody"><tr><td colspan="6" class="px-4 py-4 text-gray-400">Cargando…</td></tr></tbody>
       </table>
@@ -458,7 +618,17 @@ async function renderRegistrosTable(main){
         <td class="px-4 py-2">${r.sucursales?.nombre||''}</td>
         <td class="px-4 py-2 text-gray-500">${r.comentario||''}${r.es_duplicado ? (r.status==='Parcial' ? '<br><span class="text-amber-600 font-medium">⚠ Entrega en parcialidades</span>' : '<br><span class="text-red-600 font-medium">⚠ Duplicado</span>') : ''}</td>
         <td class="px-4 py-2 text-gray-400">${new Date(r.created_at).toLocaleString()}</td>
-      </tr>`).join('') || `<tr><td colspan="6" class="px-4 py-4 text-gray-400">Sin resultados.</td></tr>`;
+        ${isAdmin ? `<td class="px-4 py-2"><button data-del="${r.id}" class="text-red-500 hover:text-red-700 text-xs">Eliminar</button></td>` : ''}
+      </tr>`).join('') || `<tr><td colspan="7" class="px-4 py-4 text-gray-400">Sin resultados.</td></tr>`;
+    if (isAdmin){
+      tbody.querySelectorAll('[data-del]').forEach(btn => btn.onclick = async ()=>{
+        if (!confirm('¿Eliminar este registro? Esta acción no se puede deshacer.')) return;
+        const { error } = await sb.from('registros').delete().eq('id', btn.dataset.del);
+        if (error){ toast(error.message, false); return; }
+        toast('Registro eliminado');
+        renderRegistrosTable(main);
+      });
+    }
   }
 
   function aplicarFiltros(){
@@ -496,9 +666,15 @@ function renderNuevoRegistroDesktop(main){
     <h1 class="font-semibold text-lg mb-4">Nuevo registro</h1>
     <form id="entryFormD" class="bg-white border border-gray-200 rounded-2xl p-5 max-w-md space-y-4">
       <div><label class="text-sm text-gray-600">Picking</label>
-        <input id="dTicket" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"></div>
+        <div class="flex gap-2 mt-1">
+          <input id="dTicket" required class="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400">
+          ${botonEscaner('dTicket')}
+        </div></div>
       <div><label class="text-sm text-gray-600">Traspaso</label>
-        <input id="dTraspaso" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"></div>
+        <div class="flex gap-2 mt-1">
+          <input id="dTraspaso" required class="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400">
+          ${botonEscaner('dTraspaso')}
+        </div></div>
       <div><label class="text-sm text-gray-600">Status</label>
         <select id="dStatus" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"><option>Total</option><option>Parcial</option></select></div>
       ${perfil.rol==='Admin' ? `<div><label class="text-sm text-gray-600">Sucursal</label>
@@ -508,6 +684,8 @@ function renderNuevoRegistroDesktop(main){
       <button class="w-full bg-indigo-600 text-white rounded-lg py-2.5 text-sm font-medium hover:bg-indigo-700 transition">Guardar</button>
     </form>`;
   exclusividad('dTicket', 'dTraspaso');
+  soloNumeros('dTicket'); soloNumeros('dTraspaso');
+  main.querySelectorAll('[data-scan]').forEach(btn => btn.onclick = ()=> abrirEscaner(btn.dataset.scan));
   document.getElementById('entryFormD').addEventListener('submit', async e=>{
     e.preventDefault();
     const sucursal_id = perfil.rol==='Admin' ? document.getElementById('dSucursal').value : perfil.sucursal_id;
@@ -541,9 +719,9 @@ async function renderUsuarios(main){
     <div class="bg-white border border-gray-200 rounded-2xl overflow-hidden">
       <table class="w-full text-sm">
         <thead class="bg-gray-50 text-gray-500 text-left">
-          <tr><th class="px-4 py-2">Nombre</th><th class="px-4 py-2">Correo</th><th class="px-4 py-2">Rol</th><th class="px-4 py-2">Sucursal</th></tr>
+          <tr><th class="px-4 py-2">Nombre</th><th class="px-4 py-2">Usuario</th><th class="px-4 py-2">Rol</th><th class="px-4 py-2">Sucursal</th><th class="px-4 py-2">Estado</th><th class="px-4 py-2"></th><th class="px-4 py-2"></th></tr>
         </thead>
-        <tbody id="tbodyUsr"><tr><td colspan="4" class="px-4 py-4 text-gray-400">Cargando…</td></tr></tbody>
+        <tbody id="tbodyUsr"><tr><td colspan="7" class="px-4 py-4 text-gray-400">Cargando…</td></tr></tbody>
       </table>
     </div>
     <dialog id="dlgUsr" class="rounded-2xl p-0 w-full max-w-sm backdrop:bg-black/30">
@@ -551,12 +729,14 @@ async function renderUsuarios(main){
         <h2 class="font-semibold text-base mb-2">Nuevo usuario</h2>
         <div><label class="text-sm text-gray-600">Nombre completo</label>
           <input id="uNombre" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
-        <div><label class="text-sm text-gray-600">Correo</label>
-          <input id="uEmail" type="email" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
+        <div><label class="text-sm text-gray-600">Usuario (para iniciar sesión)</label>
+          <input id="uUsername" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
         <div><label class="text-sm text-gray-600">Contraseña inicial</label>
           <input id="uPass" type="password" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
         <div><label class="text-sm text-gray-600">Rol</label>
-          <select id="uRol" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"><option value="2">Registro</option><option value="1">Admin</option></select></div>
+          <select id="uRol" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">
+            <option value="2">Registro</option><option value="1">Admin</option><option value="3">Auditor</option>
+          </select></div>
         <div><label class="text-sm text-gray-600">Sucursal</label>
           <select id="uSucursal" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">
             ${opciones}<option value="__nueva__">+ Agregar nueva sucursal…</option>
@@ -600,17 +780,17 @@ async function renderUsuarios(main){
   document.getElementById('formUsr').addEventListener('submit', async e=>{
     e.preventDefault();
     if (selSuc.value === '__nueva__'){ toast('Guarda la nueva sucursal antes de crear el usuario', false); return; }
-    // Nota: la creación de auth.users vía signUp requiere confirmación de correo
-    // o uso de la Admin API desde un backend seguro (service_role). Aquí se usa signUp estándar.
-    const { data, error } = await sb.auth.signUp({
-      email: document.getElementById('uEmail').value.trim(),
-      password: document.getElementById('uPass').value
+    const username = document.getElementById('uUsername').value.trim().toLowerCase();
+    const emailInterno = `${username}@kuroda-operativo.com`;
+    const { data: res, error } = await sb.functions.invoke('admin-create-user', {
+      body: { email: emailInterno, password: document.getElementById('uPass').value }
     });
-    if (error){ toast(error.message, false); return; }
+    if (error || res?.error){ toast((res?.error) || error.message, false); return; }
     const { error: err2 } = await sb.from('usuarios').insert({
-      id: data.user.id,
+      id: res.user_id,
       nombre_completo: document.getElementById('uNombre').value.trim(),
-      email: document.getElementById('uEmail').value.trim(),
+      email: emailInterno,
+      username,
       rol_id: Number(document.getElementById('uRol').value),
       sucursal_id: document.getElementById('uSucursal').value
     });
@@ -620,17 +800,150 @@ async function renderUsuarios(main){
 
   cargarTablaUsuarios();
 }
+
+function dialogoEditarUsuario(u){
+  const opciones = sucursales.map(s=>`<option value="${s.id}" ${s.id===u.sucursal_id?'selected':''}>${s.nombre}</option>`).join('');
+  const dlg = document.createElement('dialog');
+  dlg.className = 'rounded-2xl p-0 w-full max-w-sm backdrop:bg-black/30';
+  dlg.innerHTML = `
+    <form class="p-5 space-y-3">
+      <h2 class="font-semibold text-base mb-2">Editar usuario</h2>
+      <div><label class="text-sm text-gray-600">Nombre completo</label>
+        <input id="eNombre" value="${u.nombre_completo}" required class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
+      <div><label class="text-sm text-gray-600">Usuario (para iniciar sesión)</label>
+        <input id="eUsername" value="${u.username || ''}" placeholder="ej. alberto" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"></div>
+      <div><label class="text-sm text-gray-600">Rol</label>
+        <select id="eRol" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">
+          <option value="2" ${u.rol_id===2?'selected':''}>Registro</option>
+          <option value="1" ${u.rol_id===1?'selected':''}>Admin</option>
+          <option value="3" ${u.rol_id===3?'selected':''}>Auditor</option>
+        </select></div>
+      <div><label class="text-sm text-gray-600">Sucursal</label>
+        <select id="eSucursal" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">${opciones}</select></div>
+      <div><label class="text-sm text-gray-600">Estado</label>
+        <select id="eActivo" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">
+          <option value="true" ${u.activo?'selected':''}>Activo</option>
+          <option value="false" ${!u.activo?'selected':''}>Inactivo</option>
+        </select></div>
+      <div class="pt-1 border-t border-gray-100">
+        <label class="text-sm text-gray-600">Restablecer contraseña (opcional)</label>
+        <input id="eNuevaPass" type="password" placeholder="Dejar en blanco para no cambiar" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">
+        <p class="text-xs text-gray-400 mt-1">Requiere la Edge Function de administración (ver nota más abajo).</p>
+      </div>
+      <div class="flex gap-2 pt-2">
+        <button type="button" id="eCancelar" class="flex-1 border border-gray-200 rounded-lg py-2 text-sm">Cancelar</button>
+        <button class="flex-1 bg-indigo-600 text-white rounded-lg py-2 text-sm">Guardar</button>
+      </div>
+    </form>`;
+  document.body.appendChild(dlg);
+  dlg.showModal();
+  dlg.querySelector('#eCancelar').onclick = ()=>{ dlg.close(); dlg.remove(); };
+
+  dlg.querySelector('form').addEventListener('submit', async e=>{
+    e.preventDefault();
+    const { error } = await sb.from('usuarios').update({
+      nombre_completo: dlg.querySelector('#eNombre').value.trim(),
+      username: dlg.querySelector('#eUsername').value.trim().toLowerCase() || null,
+      rol_id: Number(dlg.querySelector('#eRol').value),
+      sucursal_id: dlg.querySelector('#eSucursal').value,
+      activo: dlg.querySelector('#eActivo').value === 'true'
+    }).eq('id', u.id);
+    if (error){ toast(error.message, false); return; }
+
+    const nuevaPass = dlg.querySelector('#eNuevaPass').value.trim();
+    if (nuevaPass){
+      const { error: errPass } = await sb.functions.invoke('admin-reset-password', {
+        body: { user_id: u.id, new_password: nuevaPass }
+      });
+      if (errPass){ toast('Perfil actualizado, pero la contraseña no se pudo cambiar: ' + errPass.message, false); }
+      else toast('Usuario y contraseña actualizados');
+    } else {
+      toast('Usuario actualizado');
+    }
+    dlg.close(); dlg.remove();
+    cargarTablaUsuarios();
+  });
+}
 async function cargarTablaUsuarios(){
   const { data, error } = await sb.from('usuarios').select('*, roles(nombre), sucursales(nombre)');
   const tbody = document.getElementById('tbodyUsr');
-  if (error){ tbody.innerHTML = `<tr><td colspan="4" class="px-4 py-4 text-red-600">${error.message}</td></tr>`; return; }
+  if (error){ tbody.innerHTML = `<tr><td colspan="7" class="px-4 py-4 text-red-600">${error.message}</td></tr>`; return; }
   tbody.innerHTML = data.map(u => `
     <tr class="border-t border-gray-100">
       <td class="px-4 py-2">${u.nombre_completo}</td>
-      <td class="px-4 py-2 text-gray-500">${u.email}</td>
+      <td class="px-4 py-2 text-gray-500">${u.username || '—'}</td>
       <td class="px-4 py-2">${u.roles?.nombre}</td>
       <td class="px-4 py-2">${u.sucursales?.nombre||'—'}</td>
+      <td class="px-4 py-2">${u.activo ? '<span class="text-emerald-600">Activo</span>' : '<span class="text-gray-400">Inactivo</span>'}</td>
+      <td class="px-4 py-2"><button data-edit="${u.id}" class="text-indigo-600 text-xs hover:underline">Editar</button></td>
+      <td class="px-4 py-2">${u.id === perfil.id ? '' : `<button data-del="${u.id}" class="text-red-500 text-xs hover:underline">Eliminar</button>`}</td>
     </tr>`).join('');
+  tbody.querySelectorAll('[data-edit]').forEach(btn => btn.onclick = ()=>{
+    const u = data.find(x => x.id === btn.dataset.edit);
+    dialogoEditarUsuario(u);
+  });
+  tbody.querySelectorAll('[data-del]').forEach(btn => btn.onclick = async ()=>{
+    if (!confirm('¿Eliminar este usuario de forma permanente? Esta acción no se puede deshacer.')) return;
+    const { data: res, error: errDel } = await sb.functions.invoke('admin-delete-user', {
+      body: { user_id: btn.dataset.del }
+    });
+    if (errDel || res?.error){ toast((res?.error) || errDel.message, false); return; }
+    toast('Usuario eliminado');
+    cargarTablaUsuarios();
+  });
+}
+
+/* ============================================================
+   AUDITORÍA — solo Admin y Auditor; valida duplicados
+============================================================ */
+async function renderAuditoria(main){
+  main.innerHTML = `
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="font-semibold text-lg">Auditoría de duplicados</h1>
+      <select id="fEstatusAud" class="px-3 py-2 border border-gray-200 rounded-lg text-sm">
+        <option value="Pendiente">Pendientes</option>
+        <option value="Aprobado">Aprobados</option>
+        <option value="">Todos</option>
+      </select>
+    </div>
+    <div id="audWrap" class="space-y-2"><p class="text-sm text-gray-400">Cargando…</p></div>`;
+
+  async function cargar(){
+    const estatus = document.getElementById('fEstatusAud').value;
+    let query = sb.from('registros').select('*, sucursales(nombre)').eq('es_duplicado', true).order('created_at',{ascending:false});
+    if (estatus) query = query.eq('auditoria_status', estatus);
+    const { data, error } = await query;
+    const wrap = document.getElementById('audWrap');
+    if (error){ wrap.innerHTML = `<p class="text-red-600 text-sm">${error.message}</p>`; return; }
+    if (!data.length){ wrap.innerHTML = `<p class="text-sm text-gray-400">Sin registros en esta vista.</p>`; return; }
+
+    wrap.innerHTML = data.map(r => `
+      <div class="bg-white border rounded-xl p-4 flex items-center justify-between ${r.status==='Parcial'?'border-amber-300':'border-red-300'}">
+        <div>
+          <p class="text-sm font-medium">Picking ${r.ticket} · Traspaso ${r.traspaso}
+            <span class="ml-2 px-2 py-0.5 rounded-full text-xs ${r.status==='Total'?'bg-emerald-100 text-emerald-700':'bg-amber-100 text-amber-700'}">${r.status}</span>
+          </p>
+          <p class="text-xs text-gray-500 mt-1">${r.sucursales?.nombre||''} · ${new Date(r.created_at).toLocaleString()}</p>
+          ${r.comentario ? `<p class="text-xs text-gray-500 mt-1">${r.comentario}</p>` : ''}
+          <p class="text-xs mt-1 font-medium ${r.auditoria_status==='Aprobado' ? 'text-emerald-600' : 'text-red-600'}">
+            ${r.auditoria_status==='Aprobado' ? '✓ Aprobado por auditoría' : '⚠ Pendiente de revisión'}</p>
+        </div>
+        ${r.auditoria_status !== 'Aprobado'
+          ? `<button data-aprobar="${r.id}" class="bg-emerald-600 text-white text-sm px-3 py-2 rounded-lg hover:bg-emerald-700">Aprobar</button>`
+          : ''}
+      </div>`).join('');
+
+    wrap.querySelectorAll('[data-aprobar]').forEach(btn => btn.onclick = async ()=>{
+      const { error } = await sb.from('registros').update({
+        auditoria_status: 'Aprobado', auditado_por: perfil.id, auditado_en: new Date().toISOString()
+      }).eq('id', btn.dataset.aprobar);
+      if (error){ toast(error.message, false); return; }
+      toast('Registro aprobado por auditoría');
+      cargar();
+    });
+  }
+  document.getElementById('fEstatusAud').addEventListener('change', cargar);
+  cargar();
 }
 
 /* ============================================================
@@ -774,3 +1087,4 @@ function renderConfig(main){
 </script>
 </body>
 </html>
+
